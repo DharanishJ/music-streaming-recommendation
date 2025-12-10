@@ -1,0 +1,14 @@
+{
+  "name": "spark-ui-proxy",
+  "version": "1.0.0",
+  "description": "A proxy server to simulate Spark Web UI",
+  "main": "spark-proxy.js",
+  "scripts": {
+    "start": "node spark-proxy.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "author": "Spark UI Developer",
+  "license": "MIT"
+}

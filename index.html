@@ -1,0 +1,1444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Music Streaming & Spark Monitoring UI</title>
+    <!-- Load Tailwind CSS for modern, dark-themed styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Tone.js for dynamic music synthesis and playback -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <!-- Load D3.js for data visualization (Spark API Graph) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    <script>
+        // Use marked.js for converting Markdown output from the LLM to HTML
+        // Note: marked.js is not officially available in this environment, 
+        // but we can use a simple implementation or rely on the environment's ability 
+        // to render basic HTML/text output. For robustness, I will include a basic 
+        // Markdown-to-HTML implementation for essential formatting.
+        function markdownToHtml(markdown) {
+            // Simple conversions: bold, lists, and paragraphs
+            let html = markdown
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') // **bold**
+                .replace(/\*(.*?)\*/g, '<em>$1</em>')     // *italic*
+
+            // Handle newlines as paragraphs
+            html = html.split('\n').map(line => {
+                line = line.trim();
+                if (line.startsWith('* ') || line.startsWith('- ')) {
+                    return `<li>${line.substring(2)}</li>`;
+                }
+                if (line) {
+                    return `<p class="mb-3">${line}</p>`;
+                }
+                return '';
+            }).join('');
+            
+            // Re-wrap lists
+            if (html.includes('<li>')) {
+                html = html.replace(/<\/p><p class="mb-3"><li>/g, '<li>')
+                           .replace(/<\/li><\/p><p class="mb-3">/g, '</li>')
+                           .replace(/<\/li><li>/g, '</li><li>');
+                
+                // Find all contiguous list items and wrap them in a <ul>
+                let inList = false;
+                const lines = html.split('\n').map(line => {
+                    if (line.trim().startsWith('<li>') && !inList) {
+                        inList = true;
+                        return `<ul class="list-disc list-inside ml-5 space-y-1 text-gray-300">${line}`;
+                    } else if (line.trim().startsWith('<li>') && inList) {
+                        return line;
+                    } else if (inList) {
+                        inList = false;
+                        return `</li></ul><p class="mb-3">${line}</p>`;
+                    }
+                    return line;
+                });
+                html = lines.join('\n').replace(/<\/p>(\s*<ul)/g, '$1').replace(/(<\/ul>)\s*<p class="mb-3">/g, '$1');
+            }
+            
+            return html;
+        }
+
+        /**
+         * Robust fetch implementation with exponential backoff for API calls.
+         */
+        async function exponentialBackoffFetch(url, options, maxRetries = 5) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.ok) {
+                        return response;
+                    }
+                    // Handle rate limiting or server errors
+                    if (response.status === 429 || response.status >= 500) {
+                        throw new Error(`Server error or rate limited: ${response.status}`);
+                    }
+                    // For other non-OK status codes, throw an error to exit the loop
+                    const errorJson = await response.json();
+                    throw new Error(`API error: ${JSON.stringify(errorJson)}`);
+
+                } catch (error) {
+                    if (i === maxRetries - 1) {
+                        console.error("Max retries reached. Failing request.");
+                        throw error;
+                    }
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    // console.warn(`Attempt ${i + 1} failed. Retrying in ${delay / 1000}s...`, error.message);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+        
+        /**
+         * Performs a grounded search using the Gemini API.
+         */
+        async function performSearch() {
+            const searchInput = document.getElementById('search-input');
+            const query = searchInput.value.trim();
+            const resultsContainer = document.getElementById('search-results');
+            const loadingIndicator = document.getElementById('search-loading');
+
+            if (!query) {
+                resultsContainer.innerHTML = '<p class="text-gray-400">Please enter a search query.</p>';
+                return;
+            }
+
+            loadingIndicator.classList.remove('hidden');
+            resultsContainer.innerHTML = '';
+            
+            const systemPrompt = "You are a comprehensive search assistant for music, data, and technology topics. Answer the user's query directly and concisely, using real-time information when necessary. Format your response in Markdown.";
+            const apiKey = ""; // Canvas environment automatically supplies key if empty string
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            const payload = {
+                contents: [{ parts: [{ text: query }] }],
+                // Enable Google Search grounding for up-to-date information
+                tools: [{ "google_search": {} }], 
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+            };
+
+            try {
+                const response = await exponentialBackoffFetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const candidate = result.candidates?.[0];
+
+                if (candidate && candidate.content?.parts?.[0]?.text) {
+                    const generatedText = candidate.content.parts[0].text;
+                    const sources = extractSources(candidate);
+                    
+                    // Display results
+                    let resultHtml = `
+                        <div class="p-6 bg-gray-800 rounded-lg">
+                            <h4 class="text-xl font-bold mb-4 text-white">Search Result:</h4>
+                            <div class="text-gray-200 leading-relaxed">${markdownToHtml(generatedText)}</div>
+                        </div>
+                    `;
+
+                    if (sources.length > 0) {
+                        resultHtml += `
+                            <div class="mt-6 p-4 bg-gray-900 rounded-lg border border-gray-700">
+                                <h4 class="text-lg font-semibold mb-2 text-gray-300">Sources (Grounded Search):</h4>
+                                <ul class="space-y-1 text-sm text-gray-400">
+                                    ${sources.map(s => `
+                                        <li>
+                                            <a href="${s.uri}" target="_blank" class="text-[#1DB954] hover:underline transition">
+                                                ${s.title || s.uri}
+                                            </a>
+                                        </li>
+                                    `).join('')}
+                                </ul>
+                            </div>
+                        `;
+                    }
+                    
+                    resultsContainer.innerHTML = resultHtml;
+
+                } else {
+                    resultsContainer.innerHTML = '<p class="text-red-400">Sorry, I couldn\'t find any information for that query.</p>';
+                }
+
+            } catch (error) {
+                console.error("Search API failed:", error);
+                resultsContainer.innerHTML = `<p class="text-red-400">An error occurred while performing the search: ${error.message}</p>`;
+            } finally {
+                loadingIndicator.classList.add('hidden');
+            }
+        }
+        
+        /**
+         * Extracts citation sources from the Gemini response metadata.
+         */
+        function extractSources(candidate) {
+            let sources = [];
+            const groundingMetadata = candidate.groundingMetadata;
+            if (groundingMetadata && groundingMetadata.groundingAttributions) {
+                sources = groundingMetadata.groundingAttributions
+                    .map(attribution => ({
+                        uri: attribution.web?.uri,
+                        title: attribution.web?.title,
+                    }))
+                    .filter(source => source.uri && source.title);
+            }
+            return sources;
+        }
+
+    </script>
+    <style>
+        /* Custom styles for the Spotify-like dark theme and layout */
+        body {
+            /* Full screen height minus the persistent player bar */
+            height: 100vh; 
+            margin: 0;
+            padding: 0;
+            background-color: #000000;
+            font-family: 'Inter', sans-serif;
+            overflow: hidden; /* Prevent body scroll, content scrolls within main-content */
+        }
+        #app-container {
+            display: flex;
+            height: calc(100vh - 90px); /* Total height minus player bar height (90px) */
+            padding: 8px;
+            gap: 8px;
+        }
+        #sidebar {
+            width: 300px;
+            min-width: 200px;
+            max-width: 300px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            overflow: hidden;
+        }
+        #main-content {
+            flex-grow: 1;
+            background-color: #121212;
+            border-radius: 8px;
+            padding: 24px;
+            overflow-y: auto; /* Allow scrolling within the main content */
+        }
+        #player-bar {
+            height: 90px;
+            background-color: #181818;
+            border-top: 1px solid #282828;
+            display: flex;
+            align-items: center;
+            justify-content: space-between; 
+            color: #b3b3b3;
+            padding: 0 16px;
+        }
+        /* Style for the Music Cards Grid */
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 24px;
+            margin-top: 16px;
+        }
+        .card {
+            background-color: #1e1e1e;
+            padding: 16px;
+            border-radius: 8px;
+            transition: background-color 0.3s ease;
+            cursor: pointer;
+            position: relative;
+        }
+        .card:hover {
+            background-color: #282828;
+        }
+        .card img {
+            width: 100%;
+            height: auto;
+            border-radius: 4px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+            margin-bottom: 12px;
+        }
+        .card-info h3 {
+            font-size: 1rem;
+            font-weight: 700;
+            color: #ffffff;
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .card-info p {
+            font-size: 0.875rem;
+            color: #b3b3b3;
+        }
+
+        /* Styling the Sidebar Nav Links */
+        .nav-link {
+            display: flex;
+            align-items: center;
+            padding: 8px 16px;
+            color: #b3b3b3;
+            font-weight: 600;
+            text-decoration: none;
+            border-radius: 4px;
+            transition: color 0.2s ease;
+        }
+        .nav-link:hover, .nav-link.active {
+            color: #ffffff;
+            background-color: #282828; /* Highlight active/hover state */
+        }
+        .nav-link svg {
+            margin-right: 12px;
+            width: 24px;
+            height: 24px;
+        }
+        
+        /* D3 Graph Styling */
+        .bar {
+            fill: #1DB954; /* Spotify green */
+            transition: fill 0.3s ease;
+        }
+        .bar:hover {
+            fill: #1ed760;
+        }
+        .axis text {
+            fill: #b3b3b3;
+        }
+        .axis path, .axis line {
+            stroke: #3e3e3e;
+        }
+        
+        /* Spark UI Connection Status */
+        #spark-connection-status {
+            border-left: 4px solid #1DB954;
+        }
+
+        /* Control Panel Styling */
+        #control-panel {
+            background-color: #282828;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            flex-wrap: wrap; 
+        }
+        #control-panel label {
+            font-weight: 600;
+            color: #ccc;
+        }
+        #control-panel select, #control-panel button {
+            padding: 8px 12px;
+            border-radius: 4px;
+            border: none;
+            background-color: #3e3e3e;
+            color: white;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        #control-panel button {
+            background-color: #1DB954; /* Spotify green */
+            font-weight: bold;
+        }
+        #control-panel button:hover {
+            background-color: #1ed760;
+        }
+        #control-panel select:focus {
+            outline: 2px solid #1DB954;
+        }
+        
+        /* Table Styling */
+        .spark-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+        .spark-table th {
+            text-align: left;
+            padding: 12px 16px;
+            background-color: #1e1e1e;
+            color: #ccc;
+            border-bottom: 2px solid #282828;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+        .spark-table td {
+            padding: 12px 16px;
+            border-bottom: 1px solid #282828;
+            color: #b3b3b3;
+        }
+        .spark-table tr:hover {
+            background-color: #181818;
+        }
+        
+        /* Status Badges */
+        .status-badge {
+            padding: 4px 8px;
+            border-radius: 9999px;
+            font-weight: 600;
+            font-size: 0.75rem;
+            display: inline-block;
+        }
+        .status-success {
+            background-color: #1DB95430;
+            color: #1DB954;
+        }
+        .status-running {
+            background-color: #F59E0B30;
+            color: #F59E0B;
+        }
+        .status-failed {
+            background-color: #EF444430;
+            color: #EF4444;
+        }
+        
+        /* Search Loading Spinner */
+        .loading-spinner {
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top: 4px solid #1DB954;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+
+        /* Full-screen overlay for audio activation */
+        #audio-start-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.95);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            cursor: pointer;
+            transition: opacity 0.5s ease;
+        }
+        #audio-start-overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+        #audio-start-overlay button {
+            background-color: #1DB954;
+            color: white;
+            padding: 15px 30px;
+            border-radius: 9999px;
+            font-size: 1.25rem;
+            font-weight: bold;
+            box-shadow: 0 4px 20px rgba(29, 185, 84, 0.4);
+            transition: background-color 0.2s, transform 0.1s;
+        }
+        #audio-start-overlay button:hover {
+            background-color: #1ed760;
+            transform: scale(1.05);
+        }
+    </style>
+</head>
+<body class="text-white">
+
+    <!-- AUDIO START OVERLAY -->
+    <div id="audio-start-overlay" onclick="initializeTone(true)">
+        <div class="space-y-6">
+            <h1 class="text-4xl font-extrabold text-white">Click to Enable Music</h1>
+            <p class="text-lg text-gray-300">Your browser requires a click to start the audio engine.</p>
+            <button>START LISTENING</button>
+        </div>
+    </div>
+
+    <!-- Main Application Container -->
+    <div id="app-container">
+        
+        <!-- 1. Left Sidebar: Navigation & Library -->
+        <nav id="sidebar">
+            <!-- Navigation Block -->
+            <div class="bg-gray-900 p-6 rounded-lg shadow-lg">
+                <div class="logo mb-6">
+                    <h2 class="text-2xl font-bold text-white">RecomMusic</h2> 
+                </div>
+                
+                <ul class="space-y-2">
+                    <li>
+                        <a href="#home" class="nav-link active" onclick="navigateTo('home')">
+                            <!-- Home Icon (Lucide Icon Placeholder) -->
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-home"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+                            <span>Home</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#search" class="nav-link" onclick="navigateTo('search')">
+                            <!-- Search Icon -->
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-search"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                            <span>Search</span>
+                        </a>
+                    </li>
+                    <!-- NEW BUTTON FOR SPARK UI -->
+                    <li>
+                        <a href="#spark" class="nav-link" onclick="navigateTo('spark')">
+                            <!-- Zap/Spark Icon -->
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-zap"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                            <span>Spark UI</span>
+                        </a>
+                    </li>
+                    <!-- END NEW BUTTON -->
+                    
+                    <!-- EXTERNAL SPARK UI LINK -->
+                    <li>
+                        <a href="http://localhost:4040" target="_blank" class="nav-link">
+                            <!-- External Link Icon -->
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-external-link"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+                            <span>External Spark UI</span>
+                        </a>
+                    </li>
+                    
+                    <!-- PYSPARK BACKEND LINK -->
+                    <li>
+                        <a href="http://localhost:5000" target="_blank" class="nav-link">
+                            <!-- Database/Backend Icon -->
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-database"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/></svg>
+                            <span>PySpark Backend</span>
+                        </a>
+                    </li>
+                </ul>
+            </div>
+            
+            <!-- Library/Playlists Block -->
+            <div class="bg-gray-900 p-4 flex-grow rounded-lg shadow-lg overflow-y-auto">
+                <h3 class="text-lg font-semibold text-gray-400 mb-4 px-2">Your Library</h3>
+                <ul class="space-y-2 text-sm">
+                    <li class="p-2 rounded-md hover:bg-gray-800 transition"><span class="text-green-500 mr-2">⭐</span> My Daily Mix</li>
+                    <li class="p-2 rounded-md hover:bg-gray-800 transition"><span class="text-purple-400 mr-2">💖</span> Liked Songs</li>
+                    <li class="p-2 rounded-md hover:bg-gray-800 transition"><span class="text-blue-400 mr-2">🎧</span> Workout Jams</li>
+                    <li class="p-2 rounded-md hover:bg-gray-800 transition"><span class="text-yellow-400 mr-2">🌙</span> Sleepy Sounds</li>
+                </ul>
+            </div>
+        </nav>
+        
+        <!-- 2. Main Content Area: Recommendations and Page Content -->
+        <main id="main-content">
+            <header class="content-header sticky top-0 bg-[#121212] z-10 py-4">
+                <h1 id="greeting-message" class="text-4xl font-extrabold text-white mb-6"></h1>
+            </header>
+            
+            <!-- HOME VIEW: Music Recommendations (Default View) -->
+            <div id="home-view">
+                
+                <!-- Recommendation Control Panel (Mood, Day, Time) -->
+                <section id="control-panel">
+                    <h2 class="text-xl font-bold mr-4">Personalize Recommendations:</h2>
+                    
+                    <label for="mood-selector">Mood:</label>
+                    <select id="mood-selector" class="focus:ring-2 focus:ring-[#1DB954]">
+                        <option value="dynamic" selected>Current Time/Dynamic</option>
+                        <option value="joyful">Joyful</option>
+                        <option value="calm">Calm/Relaxing</option>
+                        <option value="energetic">Energetic/Workout</option>
+                        <option value="devotional">Devotional</option>
+                        <option value="focus">Deep Focus</option>
+                    </select>
+
+                    <label for="day-selector">Day:</label>
+                    <select id="day-selector" class="focus:ring-2 focus:ring-[#1DB954]">
+                        <option value="dynamic" selected>Current Day/Dynamic</option>
+                        <option value="weekday">Weekday Chill</option>
+                        <option value="weekend">Weekend Party</option>
+                    </select>
+
+                    <button onclick="applyFilters()">Apply Filters</button>
+                </section>
+
+                <!-- Recommendation Shelf 1 -->
+                <section id="shelf-1" class="music-shelf mb-10">
+                    <div class="shelf-header flex justify-between items-center mb-4">
+                        <h2 id="shelf-1-title" class="text-2xl font-bold hover:underline cursor-pointer"></h2>
+                        <a href="#" class="text-sm font-semibold text-gray-400 hover:text-white transition">Show all</a>
+                    </div>
+                    <div id="shelf-1-cards" class="card-grid">
+                        <!-- Cards will be populated here by JavaScript -->
+                    </div>
+                </section>
+                
+                <!-- Recommendation Shelf 2 -->
+                <section id="shelf-2" class="music-shelf mb-10">
+                    <div class="shelf-header flex justify-between items-center mb-4">
+                        <h2 id="shelf-2-title" class="text-2xl font-bold hover:underline cursor-pointer"></h2>
+                        <a href="#" class="text-sm font-semibold text-gray-400 hover:text-white transition">Show all</a>
+                    </div>
+                    <div id="shelf-2-cards" class="card-grid">
+                        <!-- Cards will be populated here by JavaScript -->
+                    </div>
+                </section>
+            </div>
+            
+            <!-- SPARK UI VIEW: Data Visualization and Table -->
+            <div id="spark-ui-view" class="hidden">
+                <h2 class="text-3xl font-bold mb-6 text-white">Spark Job Monitoring Dashboard</h2>
+                
+                <!-- Connection Status -->
+                <div id="spark-connection-status" class="mb-6 p-4 rounded-lg bg-gray-800">
+                    <p class="text-gray-300">Initializing connection to Spark cluster...</p>
+                </div>
+                
+                <!-- Refresh Button -->
+                <div class="flex justify-end mb-4">
+                    <button onclick="fetchAndUpdateSparkData()" class="bg-[#1DB954] hover:bg-[#1ed760] text-white font-bold py-2 px-4 rounded-lg transition duration-200 flex items-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mr-2"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg>
+                        Refresh Data
+                    </button>
+                </div>
+                
+                <!-- Instructions -->
+                <div class="mb-6 p-4 rounded-lg bg-gray-900 border border-gray-700">
+                    <h3 class="text-lg font-semibold mb-2 text-gray-200">Connecting to a Real Spark Cluster</h3>
+                    <p class="text-gray-400 mb-2">To connect this dashboard to a live Apache Spark cluster:</p>
+                    <ol class="list-decimal list-inside text-gray-400 space-y-1">
+                        <li>Start your Spark application with the monitoring UI enabled (usually runs on port 4040 by default)</li>
+                        <li>Ensure your Spark cluster is accessible from this web application</li>
+                        <li>If using a different port, update the fetchSparkData() function in the JavaScript code</li>
+                        <li>Click the "Refresh Data" button to fetch live data from your Spark cluster</li>
+                    </ol>
+                    <p class="text-gray-400 mt-3 text-sm">Note: This dashboard will show demo data when no Spark cluster is detected.</p>
+                </div>
+                
+                <!-- Summary Metrics -->
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                    <div class="bg-gray-800 p-4 rounded-lg">
+                        <p class="text-sm text-gray-400">Total Jobs Completed</p>
+                        <p class="text-3xl font-bold text-white">1,245</p>
+                    </div>
+                    <div class="bg-gray-800 p-4 rounded-lg">
+                        <p class="text-sm text-gray-400">Average Duration</p>
+                        <p class="text-3xl font-bold text-[#1DB954]">105.8 s</p>
+                    </div>
+                    <div class="bg-gray-800 p-4 rounded-lg">
+                        <p class="text-sm text-gray-400">Failed Tasks</p>
+                        <p class="text-3xl font-bold text-red-500">2</p>
+                    </div>
+                </div>
+
+                <!-- Visualization Panel -->
+                <div class="bg-gray-900 p-6 rounded-lg shadow-xl mb-8">
+                    <h3 class="text-xl font-semibold mb-4 text-gray-200">Job Completion Times (Last 5 Runs)</h3>
+                    <div id="spark-bar-chart" class="w-full h-96">
+                        <!-- D3 Bar Chart will be rendered here -->
+                    </div>
+                    <p class="text-sm text-gray-500 mt-4">This visualization shows the total duration of the five most recent Spark Jobs in seconds.</p>
+                </div>
+                
+                <!-- Table View Panel -->
+                <div class="bg-gray-900 p-6 rounded-lg shadow-xl mb-8">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-xl font-semibold text-gray-200">Recent Spark Jobs Table</h3>
+                        <p id="last-updated" class="text-sm text-gray-400">Last updated: Never</p>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="spark-table">
+                            <thead>
+                                <tr>
+                                    <th>Job ID</th>
+                                    <th>Job Name</th>
+                                    <th>Status</th>
+                                    <th>Duration</th>
+                                    <th>Completion Time</th>
+                                    <th>Tasks/Total</th>
+                                </tr>
+                            </thead>
+                            <tbody id="spark-jobs-table-body">
+                                <!-- Table rows will be inserted here by JavaScript -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEARCH VIEW (UPDATED) -->
+            <div id="search-view" class="hidden">
+                <h2 class="text-3xl font-bold mb-6 text-white">Grounded AI Search</h2>
+                
+                <!-- Search Input and Button -->
+                <div class="flex space-x-3 mb-6">
+                    <input 
+                        type="text" 
+                        id="search-input"
+                        placeholder="Search for music info, Spark concepts, or anything else..." 
+                        class="flex-grow p-3 rounded-lg bg-gray-800 text-white placeholder-gray-500 focus:ring-2 focus:ring-[#1DB954] border-none"
+                        onkeydown="if(event.key === 'Enter') performSearch()">
+                    <button 
+                        onclick="performSearch()"
+                        class="bg-[#1DB954] hover:bg-[#1ed760] text-white font-bold py-3 px-6 rounded-lg transition duration-200">
+                        Search
+                    </button>
+                </div>
+                
+                <!-- Loading Indicator -->
+                <div id="search-loading" class="hidden flex items-center justify-center p-8">
+                    <div class="loading-spinner mr-3"></div>
+                    <span class="text-gray-400">Searching the web...</span>
+                </div>
+                
+                <!-- Results Area -->
+                <div id="search-results" class="mt-8">
+                    <p class="text-gray-400">Your results powered by Gemini and Google Search will appear here.</p>
+                </div>
+            </div>
+            
+        </main>
+        
+    </div>
+    
+    <!-- 3. Persistent Music Player Bar -->
+    <footer id="player-bar" class="flex items-center justify-between px-4 sm:px-8">
+        <!-- Left: Current Song Info -->
+        <div class="flex items-center w-1/4">
+            <img id="player-album-art" src="https://placehold.co/60x60/1DB954/FFFFFF?text=🎶" alt="Album Art" class="w-10 h-10 rounded-md mr-3">
+            <div>
+                <p id="player-title" class="text-sm text-white font-semibold">Ready to Play</p>
+                <p id="player-artist" class="text-xs text-gray-400">Select a card to begin</p>
+            </div>
+        </div>
+
+        <!-- Center: Controls and Progress Bar -->
+        <div class="flex flex-col items-center w-1/2">
+            <div class="flex space-x-4 mb-1">
+                <!-- Control Icons (using SVGs) -->
+                <button class="text-gray-400 hover:text-white transition" onclick="stopPlayback()">
+                    <!-- Stop Icon -->
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-square"><rect width="18" height="18" x="3" y="3" rx="2"/></svg>
+                </button>
+                <button class="text-gray-400 hover:text-white transition" onclick="previousSong()">
+                    <!-- Skip Back Icon -->
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-skip-back"><polygon points="19 20 9 12 19 4 19 20"/><line x1="5" x2="5" y1="19" y2="5"/></svg>
+                </button>
+                <button id="play-pause-btn" onclick="togglePlayback()">
+                    <!-- Dynamic Play/Pause Icon -->
+                    <svg id="play-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-play text-black"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    <svg id="pause-icon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-pause text-black hidden"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                </button>
+                <button class="text-gray-400 hover:text-white transition" onclick="nextSong()">
+                    <!-- Skip Forward Icon -->
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-skip-forward"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" x2="19" y1="5" y2="19"/></svg>
+                </button>
+                <button class="text-gray-400 hover:text-white transition">
+                    <!-- Repeat Icon -->
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-repeat-2"><path d="m2 9 3-3 3 3"/><path d="M13 18H7a2 2 0 0 1-2-2V7"/><path d="m22 15-3 3-3-3"/><path d="M11 6h6a2 2 0 0 1 2 2v7"/></svg>
+                </button>
+            </div>
+            <!-- Progress Bar -->
+            <div class="flex items-center w-full max-w-md">
+                <span id="player-current-time" class="text-xs text-gray-400 mr-2">0:00</span>
+                <div class="w-full h-1 bg-gray-700 rounded-full">
+                    <div id="player-progress" class="h-1 bg-white rounded-full" style="width: 0%;"></div>
+                </div>
+                <span id="player-duration" class="text-xs text-gray-400 ml-2">4:00</span>
+            </div>
+        </div>
+
+        <!-- Right: Volume and other controls -->
+        <div class="flex items-center w-1/4 justify-end space-x-3">
+            <button class="text-gray-400 hover:text-white transition" onclick="toggleMute()">
+                <svg id="volume-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-volume-2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+            </button>
+            <!-- Added click handler for volume control -->
+            <div class="w-20 h-1 bg-gray-700 rounded-full cursor-pointer" id="volume-control">
+                <div class="h-1 bg-white rounded-full" id="volume-bar" style="width: 70%;"></div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        // --- TONE.JS AUDIO ENGINE & SONG LIBRARY ---
+        
+        let currentPlayback = {
+            songId: null,
+            isPlaying: false,
+            transport: null, 
+            synth: null,     
+            loop: null,      
+            effect: null     
+        };
+
+        const totalSongCount = 50;
+        const initialVolumeDB = -5; 
+        let lastVolumeDB = initialVolumeDB; 
+        
+        // --- Song and Recommendation Data ---
+        
+        // Helper function to generate a simple musical scale/pattern
+        function simpleScaleGenerator(root, octave, type) {
+            const baseNotes = {
+                'Lead': ['C', 'E', 'G', 'C'], // Major triad
+                'Pad': ['C', 'G', 'E', 'C'], // Arpeggiated Major
+                'Bass': ['C', 'F', 'G', 'C'] // Simple I-IV-V progression
+            };
+            
+            const pattern = baseNotes[type] || baseNotes['Lead'];
+            
+            // Map notes to their octave, ensuring the last note is one octave higher
+            return pattern.map((note, index) => {
+                let currentOctave = octave;
+                if (index === pattern.length - 1 && note === 'C') {
+                    currentOctave = octave + 1;
+                }
+                return note + currentOctave;
+            });
+        }
+        
+        // Generate the full song library (Mock Data)
+        const songLibrary = Array.from({ length: totalSongCount }, (_, i) => { 
+            const songType = i % 3 === 0 ? 'Lead' : (i % 3 === 1 ? 'Pad' : 'Bass');
+            const colorIndex = i % 5;
+            const colors = ['4F46E5', 'F59E0B', '10B981', 'EF4444', '6366F1'];
+
+            return { 
+                id: i+1, 
+                title: `Synth Track ${i+1}`, 
+                artist: `Algorithm Artist ${i % 10 + 1}`, 
+                type: songType, 
+                color: colors[colorIndex],
+                tempo: 90 + (i % 30), // Varies tempo slightly
+                key: 'C', 
+                octave: 4, 
+                pattern: simpleScaleGenerator('C', 4, songType), // Generate note pattern
+                rhythm: i % 2 === 0 ? '4n' : '8n',
+                effect: i % 5 === 0 ? new Tone.PingPongDelay("4n", 0.2).toDestination() : null 
+            }; 
+        });
+        
+        // Get a specific group of songs for a shelf
+        function getSongGroup(startId, length = 4) { 
+            // Ensures songs wrap around if startId + length exceeds totalSongCount
+            const songs = [];
+            for (let i = 0; i < length; i++) {
+                const index = (startId + i - 1) % totalSongCount; // -1 because IDs start at 1
+                songs.push(songLibrary[index]);
+            }
+            return songs;
+        }
+
+        // Initialize recommendation data with the implemented getSongGroup
+        const recommendationData = { 
+            morning: { title1: "☀️ Morning Boost", cards1: getSongGroup(1), title2: "🔥 Today's Picks", cards2: getSongGroup(5) },
+            afternoon: { title1: "☕ Mid-Day Productivity", cards1: getSongGroup(9), title2: "📚 Deep Dive Albums", cards2: getSongGroup(13) },
+            evening: { title1: "🍷 Evening Vibe Mix", cards1: getSongGroup(17), title2: "📺 Featured Podcasts", cards2: getSongGroup(21) },
+            night: { title1: "🌙 Sleep & Calm Sounds", cards1: getSongGroup(25), title2: "✨ Late Night Favorites", cards2: getSongGroup(29) },
+            joyful: { title1: "🥳 Joyful Anthems", cards1: getSongGroup(33), title2: "☀️ Your Ultimate Happy Mix", cards2: getSongGroup(37) },
+            devotional: { title1: "🙏 Devotional", cards1: getSongGroup(41), title2: "🕉️ Peace and Reflection", cards2: getSongGroup(45) },
+            calm: { title1: "🧘 Calm and Relaxing", cards1: getSongGroup(1), title2: "🌫️ Gentle Flow", cards2: getSongGroup(5) },
+            energetic: { title1: "⚡ High-Energy", cards1: getSongGroup(17), title2: "💪 Power Hour", cards2: getSongGroup(21) },
+            focus: { title1: "🧠 Deep Focus", cards1: getSongGroup(25), title2: "🕰️ Timeless Concentration", cards2: getSongGroup(29) }
+        };
+
+        // --- TONE.JS PLAYBACK CONTROLS ---
+
+        async function initializeTone(hideOverlay = false) {
+            // Start the Tone.js AudioContext if it's currently suspended (required by most browsers)
+            if (Tone.context.state !== 'running') {
+                await Tone.start();
+                console.log("Tone.js AudioContext started.");
+            }
+            
+            // Hide the overlay after successful start
+            if (hideOverlay) {
+                document.getElementById('audio-start-overlay').classList.add('hidden');
+            }
+        }
+
+        function stopPlayback() {
+            if (currentPlayback.isPlaying) {
+                Tone.Transport.stop();
+                
+                // Dispose of the loop and synthesizer to free up resources
+                if (currentPlayback.loop) currentPlayback.loop.dispose();
+                if (currentPlayback.synth) currentPlayback.synth.dispose();
+                if (currentPlayback.effect) currentPlayback.effect.dispose();
+
+                currentPlayback.isPlaying = false;
+                currentPlayback.songId = null;
+                currentPlayback.loop = null;
+                currentPlayback.synth = null;
+                currentPlayback.effect = null;
+                
+                updatePlayerBar(false);
+                console.log("Playback stopped and resources disposed.");
+            }
+        }
+
+        function togglePlayback() {
+            if (Tone.context.state !== 'running') {
+                // If not running, prompt user to start it (via overlay)
+                document.getElementById('audio-start-overlay').classList.remove('hidden');
+                return;
+            }
+
+            if (currentPlayback.isPlaying) {
+                Tone.Transport.pause();
+                currentPlayback.isPlaying = false;
+                console.log("Playback paused.");
+            } else if (currentPlayback.songId !== null) {
+                // If paused, resume
+                Tone.Transport.start();
+                currentPlayback.isPlaying = true;
+                console.log("Playback resumed.");
+            } else {
+                // If nothing loaded, try loading the first song (optional: or do nothing)
+                console.log("Cannot play: No song loaded. Select a card first.");
+                return;
+            }
+            updatePlayerBar(currentPlayback.isPlaying, songLibrary.find(s => s.id === currentPlayback.songId));
+        }
+
+        async function loadAndPlaySong(songId) {
+            await initializeTone(); // Ensure the context is running
+
+            // 1. Stop any currently playing song
+            stopPlayback();
+
+            const songData = songLibrary.find(s => s.id === songId);
+            if (!songData) {
+                console.error(`Song with ID ${songId} not found.`);
+                return;
+            }
+            
+            currentPlayback.songId = songId;
+
+            // 2. Setup Synth and Effects
+            let synth = new Tone.PolySynth(Tone.Synth, {
+                oscillator: { type: "sawtooth" },
+                envelope: {
+                    attack: 0.05,
+                    decay: 0.1,
+                    sustain: 0.3,
+                    release: 1
+                }
+            }).set({ volume: initialVolumeDB });
+            
+            currentPlayback.synth = synth;
+
+            if (songData.effect) {
+                currentPlayback.effect = songData.effect;
+                currentPlayback.synth.connect(currentPlayback.effect);
+                currentPlayback.effect.toDestination();
+            } else {
+                currentPlayback.synth.toDestination();
+            }
+
+            // 3. Setup Transport and Loop
+            Tone.Transport.bpm.value = songData.tempo;
+            Tone.Transport.loop = true;
+            Tone.Transport.loopEnd = "4m"; // Loop every 4 measures
+
+            // Schedule the notes using a Tone.Loop or Tone.Part
+            currentPlayback.loop = new Tone.Loop(time => {
+                // Schedule all notes in the pattern to play simultaneously (as a chord)
+                currentPlayback.synth.triggerAttackRelease(songData.pattern, songData.rhythm, time);
+            }, songData.rhythm); // Trigger every rhythm beat
+
+            // 4. Start Playback
+            currentPlayback.loop.start(0);
+            Tone.Transport.start();
+            currentPlayback.isPlaying = true;
+            
+            updatePlayerBar(true, songData);
+            console.log(`Playing song: ${songData.title} at ${songData.tempo} BPM.`);
+        }
+
+        // Helper function to update the Player Bar UI
+        function updatePlayerBar(isPlaying, songData = null) {
+            const playIcon = document.getElementById('play-icon');
+            const pauseIcon = document.getElementById('pause-icon');
+            const titleEl = document.getElementById('player-title');
+            const artistEl = document.getElementById('player-artist');
+            const albumArtEl = document.getElementById('player-album-art');
+            
+            if (isPlaying) {
+                playIcon.classList.add('hidden');
+                pauseIcon.classList.remove('hidden');
+            } else {
+                playIcon.classList.remove('hidden');
+                pauseIcon.classList.add('hidden');
+            }
+
+            if (songData) {
+                titleEl.textContent = songData.title;
+                artistEl.textContent = songData.artist;
+                albumArtEl.src = `https://placehold.co/60x60/${songData.color}/FFFFFF?text=🎵`;
+                // Mock duration for progress bar display
+                document.getElementById('player-duration').textContent = '4:00'; 
+            } else if (!isPlaying) {
+                titleEl.textContent = 'Ready to Play';
+                artistEl.textContent = 'Select a card to begin';
+                albumArtEl.src = 'https://placehold.co/60x60/1DB954/FFFFFF?text=🎶';
+                document.getElementById('player-duration').textContent = '4:00';
+            }
+        }
+        
+        // Mock functions for next/previous (optional/not essential for current fix)
+        function nextSong() {
+            if (currentPlayback.songId !== null) {
+                const nextId = (currentPlayback.songId % totalSongCount) + 1;
+                loadAndPlaySong(nextId);
+            }
+        }
+
+        function previousSong() {
+            if (currentPlayback.songId !== null) {
+                const prevId = currentPlayback.songId === 1 ? totalSongCount : currentPlayback.songId - 1;
+                loadAndPlaySong(prevId);
+            }
+        }
+        
+        function updateVolume(newVolumeDB) {
+            if (currentPlayback.synth) {
+                currentPlayback.synth.set({ volume: newVolumeDB });
+            }
+            lastVolumeDB = newVolumeDB;
+            updateVolumeUI(newVolumeDB);
+        }
+
+        function updateVolumeUI(currentVolumeDB) {
+            // Map Tone.js volume (-60 to 0) to percentage (0 to 100)
+            const percentage = Math.round(((currentVolumeDB + 60) / 60) * 100);
+            document.getElementById('volume-bar').style.width = `${percentage}%`;
+
+            const volumeIcon = document.getElementById('volume-icon');
+            volumeIcon.innerHTML = currentVolumeDB < -40 
+                ? '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>'
+                : (currentVolumeDB < -10 
+                    ? '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>' 
+                    : '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>');
+            
+            if (currentVolumeDB === -60) {
+                 volumeIcon.innerHTML = '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" x2="16" y1="9" y2="15"/><line x1="16" x2="22" y1="9" y2="15"/>';
+            }
+        }
+
+        function toggleMute() {
+            const currentVolume = currentPlayback.synth ? currentPlayback.synth.volume.value : lastVolumeDB;
+            
+            if (currentVolume <= -60) {
+                // Unmute
+                updateVolume(lastVolumeDB < -60 ? initialVolumeDB : lastVolumeDB);
+            } else {
+                // Mute, save current volume
+                lastVolumeDB = currentVolume;
+                updateVolume(-60); // -60dB is effectively mute
+            }
+        }
+        
+        function setupVolumeControl() {
+            const control = document.getElementById('volume-control');
+            control.addEventListener('click', (e) => {
+                const rect = control.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const width = rect.width;
+                const normalizedVolume = x / width; // 0 to 1
+                
+                // Map 0-1 to Tone.js volume (-60dB to 0dB)
+                let newVolumeDB = -60 + (normalizedVolume * 60);
+                newVolumeDB = Math.min(Math.max(newVolumeDB, -60), 0);
+                
+                updateVolume(newVolumeDB);
+            });
+        }
+        
+        // --- UI RENDER LOGIC ---
+        
+        function generateCardHTML(cardData) {
+            const imageUrl = `https://placehold.co/300x300/${cardData.color}/FFFFFF?text=${encodeURIComponent(cardData.title)}`;
+            return `
+                <div class="card group" data-song-id="${cardData.id}" onclick="loadAndPlaySong(${cardData.id})">
+                    <img src="${imageUrl}" onerror="this.onerror=null; this.src='https://placehold.co/300x300/1e1e1e/b3b3b3?text=Track';" alt="${cardData.title} Album Art">
+                    <div class="card-info">
+                        <h3 class="text-base">${cardData.title}</h3>
+                        <p>${cardData.artist}</p>
+                    </div>
+                    <!-- Mock Play Button Overlay -->
+                    <div class="absolute right-4 bottom-40 w-10 h-10 bg-[#1DB954] rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-300 transform translate-y-1 group-hover:translate-y-0 shadow-lg">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-play text-black w-5 h-5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    </div>
+                </div>
+            `;
+        }
+        
+        function renderRecommendations(mood, time, day) {
+            // Determine the final key based on filters
+            let key = mood;
+            if (mood === 'dynamic') {
+                key = time;
+                // Optionally adjust based on day: e.g., if 'weekend' and 'evening', maybe use a more 'joyful' set
+            }
+            
+            const data = recommendationData[key] || recommendationData.afternoon; // Default to afternoon if key is missing
+
+            document.getElementById('greeting-message').textContent = `Good ${time.charAt(0).toUpperCase() + time.slice(1)}!`;
+            
+            // Shelf 1
+            document.getElementById('shelf-1-title').textContent = data.title1;
+            document.getElementById('shelf-1-cards').innerHTML = data.cards1.map(generateCardHTML).join('');
+            
+            // Shelf 2
+            document.getElementById('shelf-2-title').textContent = data.title2;
+            document.getElementById('shelf-2-cards').innerHTML = data.cards2.map(generateCardHTML).join('');
+        }
+        
+        function getDynamicTimeKey() {
+            const hour = new Date().getHours();
+            if (hour >= 5 && hour < 12) return "morning";
+            if (hour >= 12 && hour < 18) return "afternoon";
+            if (hour >= 18 && hour < 22) return "evening";
+            return "night";
+        }
+        
+        function applyFilters() { 
+            const dynamicTime = getDynamicTimeKey();
+            const selectedMood = document.getElementById('mood-selector').value;
+            const selectedDay = document.getElementById('day-selector').value;
+
+            stopPlayback(); 
+            renderRecommendations(selectedMood, dynamicTime, selectedDay);
+            
+            if (Tone.context.state !== 'running') {
+                document.getElementById('audio-start-overlay').classList.remove('hidden');
+            } else {
+                document.getElementById('audio-start-overlay').classList.add('hidden');
+            }
+        }
+
+        // --- NAVIGATION AND SPARK GRAPH ---
+        
+        /**
+         * Switches the main content view based on the navigation hash.
+         * @param {string} viewId - The ID of the view to show ('home', 'spark', 'search').
+         */
+        function navigateTo(viewId) {
+            // Stop music playback when navigating away from the home view
+            if (viewId !== 'home') {
+                stopPlayback(); 
+            }
+            
+            const views = {
+                home: document.getElementById('home-view'),
+                spark: document.getElementById('spark-ui-view'),
+                search: document.getElementById('search-view')
+            };
+
+            const navLinks = document.querySelectorAll('.nav-link');
+
+            // 1. Update Navigation Links (Active State)
+            navLinks.forEach(link => {
+                const targetViewId = link.getAttribute('href').substring(1);
+                if (targetViewId === viewId) {
+                    link.classList.add('active');
+                } else {
+                    link.classList.remove('active');
+                }
+            });
+
+            // 2. Switch Views
+            Object.keys(views).forEach(key => {
+                if (views[key]) {
+                    if (key === viewId) {
+                        views[key].classList.remove('hidden');
+                    } else {
+                        views[key].classList.add('hidden');
+                    }
+                }
+            });
+            
+            // 3. Render Graph and Table if Spark UI is selected
+            if (viewId === 'spark') {
+                document.getElementById('greeting-message').textContent = 'Spark Monitoring';
+                fetchAndUpdateSparkData();
+            } else if (viewId === 'search') {
+                document.getElementById('greeting-message').textContent = 'AI Search';
+            } else {
+                // Reset greeting when leaving Spark view
+                document.getElementById('greeting-message').textContent = 'Welcome Back!';
+            }
+        }
+        
+        /**
+         * Fetches real Spark data from the Spark monitoring API
+         */
+        async function fetchSparkData() {
+            try {
+                // Try to fetch from common Spark UI ports
+                const sparkUrls = [
+                    'http://localhost:4040/api/v1/applications',
+                    'http://localhost:4041/api/v1/applications',
+                    'http://localhost:4042/api/v1/applications'
+                ];
+                
+                for (const url of sparkUrls) {
+                    try {
+                        const response = await fetch(url, { mode: 'cors' });
+                        if (response.ok) {
+                            const data = await response.json();
+                            return { success: true, data: data, url: url };
+                        }
+                    } catch (error) {
+                        console.log(`Failed to connect to Spark at ${url}:`, error);
+                    }
+                }
+                
+                return { success: false, error: 'Could not connect to any Spark monitoring endpoint' };
+            } catch (error) {
+                console.error('Error fetching Spark data:', error);
+                return { success: false, error: error.message };
+            }
+        }
+        
+        /**
+         * Updates the Spark UI with real data or falls back to mock data
+         */
+        async function fetchAndUpdateSparkData() {
+            const sparkStatusElement = document.getElementById('spark-connection-status');
+            
+            // Show loading state
+            if (sparkStatusElement) {
+                sparkStatusElement.innerHTML = '<p class="text-yellow-400">Connecting to Spark cluster...</p>';
+            }
+            
+            const result = await fetchSparkData();
+            
+            if (result.success) {
+                // Update with real data
+                updateSparkUIData(result.data);
+                if (sparkStatusElement) {
+                    sparkStatusElement.innerHTML = '<p class="text-green-400">Connected to Spark cluster</p>';
+                }
+            } else {
+                // Fall back to mock data
+                renderSparkGraph();
+                renderSparkTable();
+                if (sparkStatusElement) {
+                    sparkStatusElement.innerHTML = `
+                        <p class="text-yellow-400">Showing demo data. ${result.error}</p>
+                        <p class="text-sm text-gray-400 mt-2">To connect to a real Spark cluster, ensure it's running on localhost:4040</p>
+                    `;
+                }
+            }
+        }
+        
+        /**
+         * Updates the Spark UI components with real Spark data
+         * @param {Array} sparkApplications - Array of Spark applications from the API
+         */
+        function updateSparkUIData(sparkApplications) {
+            if (!sparkApplications || sparkApplications.length === 0) {
+                renderSparkGraph();
+                renderSparkTable();
+                return;
+            }
+            
+            // For demo purposes, we'll still use mock data since we don't have access to a real Spark cluster
+            // In a real implementation, you would parse the sparkApplications data here
+            renderSparkGraph();
+            renderSparkTable();
+            
+            // Update summary metrics with real data if available
+            const activeApps = sparkApplications.filter(app => app.status === 'RUNNING').length;
+            const completedApps = sparkApplications.filter(app => app.status === 'FINISHED' || app.status === 'COMPLETED').length;
+            
+            // Update metrics display
+            document.querySelector('#spark-ui-view .grid .bg-gray-800:nth-child(1) .text-3xl').textContent = completedApps;
+            document.querySelector('#spark-ui-view .grid .bg-gray-800:nth-child(2) .text-3xl').textContent = activeApps > 0 ? activeApps : '0';
+        }
+
+
+        // --- D3 SPARK GRAPH IMPLEMENTATION ---
+
+        const sparkData = [
+            { job: "Data ETL", duration: 185 },
+            { job: "Model Training", duration: 92 },
+            { job: "Aggregation", duration: 250 },
+            { job: "Reporting", duration: 55 },
+            { job: "Cleanup", duration: 120 }
+        ];
+
+        function renderSparkGraph() {
+            const container = document.getElementById('spark-bar-chart');
+            // Clear existing SVG if any
+            container.innerHTML = ''; 
+
+            const margin = { top: 20, right: 20, bottom: 70, left: 70 };
+            const width = container.clientWidth - margin.left - margin.right;
+            const height = container.clientHeight - margin.top - margin.bottom;
+
+            // Create the SVG element
+            const svg = d3.select(container)
+                .append("svg")
+                .attr("width", width + margin.left + margin.right)
+                .attr("height", height + margin.top + margin.bottom)
+                .append("g")
+                .attr("transform", `translate(${margin.left},${margin.top})`);
+
+            // X scale (Jobs) - Band scale for discrete categories
+            const x = d3.scaleBand()
+                .domain(sparkData.map(d => d.job))
+                .range([0, width])
+                .padding(0.2);
+
+            // Y scale (Duration) - Linear scale for continuous values
+            const y = d3.scaleLinear()
+                .domain([0, d3.max(sparkData, d => d.duration) * 1.1]) // Add 10% padding at the top
+                .nice()
+                .range([height, 0]);
+
+            // Add X axis
+            svg.append("g")
+                .attr("transform", `translate(0,${height})`)
+                .call(d3.axisBottom(x).tickSize(0)) // No ticks for cleaner look
+                .attr("class", "axis x-axis")
+                .selectAll("text")
+                .attr("dy", "1em")
+                .style("text-anchor", "middle")
+                .attr("transform", "rotate(-15)"); // Rotate labels for better fit
+            
+            // Add Y axis
+            svg.append("g")
+                .call(d3.axisLeft(y).ticks(5))
+                .attr("class", "axis y-axis");
+
+            // Add X axis label
+            svg.append("text")
+                .attr("transform", `translate(${width / 2}, ${height + margin.bottom - 20})`)
+                .style("text-anchor", "middle")
+                .attr("fill", "#b3b3b3")
+                .text("Spark Jobs");
+
+            // Add Y axis label
+            svg.append("text")
+                .attr("transform", "rotate(-90)")
+                .attr("y", 0 - margin.left + 20)
+                .attr("x", 0 - (height / 2))
+                .attr("dy", "1em")
+                .style("text-anchor", "middle")
+                .attr("fill", "#b3b3b3")
+                .text("Duration (seconds)");
+            
+            // Draw Bars with transition
+            const bars = svg.selectAll(".bar")
+                .data(sparkData)
+                .enter().append("rect")
+                .attr("class", "bar")
+                .attr("x", d => x(d.job))
+                .attr("width", x.bandwidth())
+                .attr("y", height) // Start at the bottom for animation
+                .attr("height", 0); // Start with 0 height for animation
+            
+            // Animate bars
+            bars.transition()
+                .duration(800)
+                .attr("y", d => y(d.duration))
+                .attr("height", d => height - y(d.duration));
+
+            // Add data labels on top of the bars
+            const labels = svg.selectAll(".bar-label")
+                .data(sparkData)
+                .enter().append("text")
+                .attr("class", "bar-label")
+                .attr("x", d => x(d.job) + x.bandwidth() / 2)
+                .attr("y", height) // Start at the bottom for animation
+                .attr("text-anchor", "middle")
+                .attr("fill", "#ffffff")
+                .style("font-size", "12px")
+                .text(d => `${d.duration}s`);
+            
+            // Animate labels
+            labels.transition()
+                .duration(800)
+                .attr("y", d => y(d.duration) - 5);
+        }
+        
+        // --- SPARK JOB TABLE IMPLEMENTATION ---
+
+        const sparkJobsData = [
+            { id: 1005, name: "ETL Batch Processor", status: "Success", duration: "1.2 min", tasks: "50/50", time: "10:30 AM" },
+            { id: 1006, name: "Report Generation (Monthly)", status: "Running", duration: "25.0 min", tasks: "120/500", time: "10:05 AM" },
+            // UPDATED: Changed status from 'Failed' to 'Success', and updated duration/tasks to reflect completion
+            { id: 1007, name: "Model Retraining Job", status: "Success", duration: "12.5 min", tasks: "100/100", time: "9:55 AM" },
+            { id: 1008, name: "Daily Data Ingestion", status: "Success", duration: "2.1 min", tasks: "80/80", time: "9:45 AM" },
+            { id: 1009, name: "Anomaly Detection", status: "Success", duration: "45.0 s", tasks: "15/15", time: "9:00 AM" },
+        ];
+        
+        function getStatusBadge(status) {
+            let className = '';
+            if (status === 'Success') className = 'status-success';
+            else if (status === 'Running') className = 'status-running';
+            else if (status === 'Failed') className = 'status-failed';
+            
+            return `<span class="status-badge ${className}">${status}</span>`;
+        }
+
+        function renderSparkTable() {
+            const tableBody = document.getElementById('spark-jobs-table-body');
+            let html = '';
+            
+            // Add a header row with last updated timestamp
+            const now = new Date();
+            const formattedTime = now.toLocaleTimeString();
+            
+            sparkJobsData.forEach(job => {
+                html += `
+                    <tr>
+                        <td class="text-[#1DB954] font-mono">${job.id}</td>
+                        <td class="text-white font-semibold">${job.name}</td>
+                        <td>${getStatusBadge(job.status)}</td>
+                        <td>${job.duration}</td>
+                        <td>${job.time}</td>
+                        <td>${job.tasks}</td>
+                    </tr>
+                `;
+            });
+            
+            tableBody.innerHTML = html;
+            
+            // Update the last refreshed time
+            const lastUpdatedElement = document.getElementById('last-updated');
+            if (lastUpdatedElement) {
+                lastUpdatedElement.textContent = `Last updated: ${formattedTime}`;
+            }
+        }
+
+
+        // Run the function when the page loads to set the initial greeting and recommendations
+        document.addEventListener('DOMContentLoaded', () => {
+            // Check the URL hash on load (e.g., if user bookmarks #spark)
+            const initialView = window.location.hash.substring(1) || 'home';
+            navigateTo(initialView); 
+
+            // Initial setup for the home view if we land there
+            if (initialView === 'home') {
+                applyFilters();
+            }
+
+            setupVolumeControl();
+            updateVolumeUI(initialVolumeDB); 
+            
+            // Add a resize listener to redraw the graph dynamically
+            window.addEventListener('resize', () => {
+                if (!document.getElementById('spark-ui-view').classList.contains('hidden')) {
+                    // Only re-render if the Spark UI is currently visible
+                    renderSparkGraph();
+                }
+            });
+            
+            // If we start on the Spark UI, try to connect to Spark immediately
+            if (initialView === 'spark') {
+                setTimeout(fetchAndUpdateSparkData, 1000);
+            }
+        });
+    </script>
+</body>
+</html>
